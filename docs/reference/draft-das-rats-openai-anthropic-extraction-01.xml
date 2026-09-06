@@ -1,0 +1,812 @@
+<?xml version="1.0" encoding="utf-8"?>
+<?xml-model href="rfc7991bis.rnc"?>
+<!DOCTYPE rfc [
+  <!ENTITY nbsp "&#160;">
+  <!ENTITY zwsp "&#8203;">
+  <!ENTITY nbhy "&#8209;">
+  <!ENTITY wj "&#8288;">
+]>
+<rfc category="info"
+     docName="draft-das-rats-openai-anthropic-extraction-00"
+     ipr="trust200902"
+     submissionType="IETF"
+     xml:lang="en"
+     version="3">
+  <front>
+    <title abbrev="OpenAI/Anthropic Extraction Control">Beyond Attestation: An Execution-Finality Architecture for Controlling Release and Limiting Unauthorized Extraction and Distillation of Sensitive OpenAI and Anthropic Claude Model Information</title>
+    <seriesInfo name="Internet-Draft" value="draft-das-rats-openai-anthropic-extraction-00"/>
+    <author fullname="Sangam Das" initials="S." surname="Das">
+      <organization>Independent Inventor</organization>
+      <address>
+        <postal>
+          <city>Balasore</city>
+          <region>Odisha</region>
+          <country>India</country>
+        </postal>
+        <email>info@sangamdas.com</email>
+      </address>
+    </author>
+    <date day="31" month="August" year="2026"/>
+    <area>Security</area>
+    <workgroup>Remote ATtestation ProcedureS (RATS)</workgroup>
+    <keyword>remote attestation</keyword>
+    <keyword>confidential AI</keyword>
+    <keyword>frontier models</keyword>
+    <keyword>model extraction</keyword>
+    <keyword>model distillation</keyword>
+    <keyword>execution finality</keyword>
+    <keyword>confidential GPU</keyword>
+    <abstract>
+      <t>Anthropic and OpenAI already ship inference interfaces richer than raw completions -- log-probabilities, embeddings, hidden states, intermediate activations, KV-cache material, and diagnostic output are all in production today. Each is a channel an adversary, a compromised partner integration, or a stolen enterprise seat can use to reconstruct, steal, or distill a model far faster than by scraping ordinary text output. In this document, a "release" is any point at which such information leaves the protected execution environment and becomes usable outside it: returned to a caller, cached, forwarded, or otherwise materialized. The operational question this document answers is narrow: given that the caller is authenticated and the workload is attested, is this specific release still authorized to happen right now?</t>
+      <t>Authentication establishes who is asking. Confidential computing and remote attestation establish whether the execution environment is trustworthy. Neither establishes whether this particular release, of this particular artifact, at this particular moment, should be allowed to cross the protected boundary. A valid API key, a genuine TEE, and a passing Attestation Result are all fully compatible with an unauthorized bulk-extraction run already in progress. Rate limits, output filtering, and anomaly detection operate after the release has already happened; they make extraction easier to notice, not harder to complete.</t>
+      <t>This document specifies an execution-finality architecture that makes release control a technical precondition rather than a monitoring layer: computation is separated from authority to release, every sensitive result is held as a non-effective Candidate Release, and release becomes possible only after release-specific validation, rollback-resistant extraction-state evaluation, bounded authorization, and verification at a controlled Finality Sink. Because release authority is bound to rollback-resistant, atomically consumed extraction state rather than to a bearer credential, the volume of privileged teacher signal an adversary can accumulate through the governed path is capped by authorized state transitions, not by request volume or attacker persistence alone. The mechanism is not claimed to prevent all forms of model distillation; its objective is to make unauthorized or excessive extraction of privileged model information structurally harder to complete, not merely easier to detect afterward.</t>
+    </abstract>
+  </front>
+
+  <middle>
+    <section anchor="introduction">
+      <name>Introduction</name>
+      <t>Frontier AI model providers invest substantial resources in training, alignment, evaluation, deployment, and operation of proprietary models. Protecting the resulting model material is therefore not limited to protecting model-weight files. High-information inference artifacts, internal representations, privileged diagnostics, and repeated high-resolution outputs can also have substantial intellectual-property and security value.</t>
+      <t>The RATS architecture <xref target="RFC9334"/> provides a model in which an Attester produces Evidence, a Verifier appraises that Evidence, and a Relying Party uses Attestation Results when deciding whether to trust an entity. The Entity Attestation Token (EAT) <xref target="RFC9711"/> provides a framework for conveying attested claims. Current RATS work also addresses trustworthy assignment of accelerators <xref target="I-D.poirier-rats-eat-da"/>, composite confidential-CPU and confidential-GPU attestation <xref target="I-D.kykdxy-rats-tdx-cgpu-ear-profile"/>, and attested inference receipts <xref target="I-D.tsyrulnikov-rats-attested-inference-receipt"/>.</t>
+      <t>These mechanisms form important building blocks, but a separate question remains after a workload or accelerator has been authenticated and attested: is this particular release of sensitive model information authorized to become externally usable now?</t>
+      <t>The central architectural principle of this document is therefore:</t>
+      <blockquote><t>Computation is not authority to release.</t></blockquote>
+      <t>A model may legitimately compute information inside a protected environment without that fact alone authorizing the information to cross an externally effective release boundary.</t>
+      <t>OpenAI GPT-class and Anthropic Claude-class models are referenced in this document as recognizable examples of proprietary frontier-model deployments potentially affected by model extraction. No affiliation with, endorsement by, or implementation claim concerning these providers is implied. The architecture is vendor-neutral and applies to other frontier, enterprise, sovereign, scientific, and domain-specific AI models.</t>
+      <t>This document and <xref target="I-D.das-rats-frontier-model-extraction"/> describe the same execution-finality architecture. This document names specific frontier providers as motivating examples; <xref target="I-D.das-rats-frontier-model-extraction"/> presents the identical technical content in vendor-neutral form. Readers may cite either; implementers should treat the two as a single architecture under parallel presentation.</t>
+      <t><xref target="I-D.das-agentic-tool-binding"/> applies the same execution-finality principle to a different Candidate Release type: agentic tool-call dispatch, rather than release of sensitive model information.</t>
+    </section>
+
+    <section anchor="scope">
+      <name>Scope and Non-Goals</name>
+      <t>This document is an Informational problem-space and architecture document. It does not define a new EAT claim, COSE object, wire protocol, GPU instruction set, memory-controller design, or IANA registry.</t>
+      <t>The document focuses on protected-to-unprotected release of sensitive model information. It does not claim universal prevention of model distillation. A party that is legitimately allowed to collect ordinary model responses may still use those responses as training material. The narrower target is unauthorized, excessive, privileged, replayed, rolled-back, or bypassed extraction of information whose release policy is intended to be more restrictive than ordinary inference output.</t>
+      <t>This document does not replace authentication, authorization, RATS, confidential computing, anomaly detection, API quotas, watermarking, model-output minimization, or contractual controls. It describes an enforcement layer that can complement them.</t>
+    </section>
+
+    <section anchor="terminology">
+      <name>Terminology</name>
+      <t>This document uses the RATS terms Attester, Verifier, Relying Party, Evidence, Reference Values, Endorsements, and Attestation Results as defined by <xref target="RFC9334"/>.</t>
+      <dl newline="true">
+        <dt>Sensitive Model Information (SMI)</dt>
+        <dd>Model-related information subject to a release policy stricter than the ordinary public or tenant-visible inference interface. Depending on deployment, this may include weights, logits, log probabilities, embeddings, hidden states, intermediate activations, KV-cache material, training-related state, diagnostic outputs, reasoning-related traces when exposed by an implementation, or other high-information artifacts.</dd>
+        <dt>Candidate Release</dt>
+        <dd>A proposed transition by which SMI would become usable outside its currently protected domain. A Candidate Release is not yet treated as authorized external effect.</dd>
+        <dt>Release Authority</dt>
+        <dd>Bounded authority permitting a specific Candidate Release, or a narrowly defined class of releases, subject to validated scope and state.</dd>
+        <dt>Extraction State</dt>
+        <dd>Protected state relevant to repeated or cumulative release decisions, such as a counter, quota, accumulator, epoch, consumed-authority state, or equivalent rollback-resistant record.</dd>
+        <dt>Finality Sink</dt>
+        <dd>The first controlled boundary at which SMI can become usable by the intended external or less-trusted domain. A Finality Sink is a logical security role and need not correspond to one physical chip block.</dd>
+        <dt>Execution Finality</dt>
+        <dd>The property that an externally effective release occurs only after the applicable release authority and protected state have been verified at the relevant Finality Sink.</dd>
+      </dl>
+    </section>
+
+    <section anchor="problem-space">
+      <name>Problem Space</name>
+      <section anchor="extraction">
+        <name>Model Extraction Is Broader Than Weight Theft</name>
+        <t>An adversary does not always need direct access to a model-weight file. Repeated access to richer-than-normal inference artifacts may reveal behavior, internal representations, decision boundaries, model structure, or information useful for reconstruction and imitation.</t>
+        <t>Potential extraction targets include full probability distributions, logits, detailed log probabilities, embeddings, hidden states, intermediate activations, KV-cache material, gradients where exposed, diagnostic state, high-resolution metadata, and large collections of strategically selected outputs.</t>
+      </section>
+      <section anchor="trusted-overauthorized">
+        <name>The Trusted-but-Over-Authorized Case</name>
+        <t>A difficult case arises when the requester is authenticated, the workload is legitimate, the accelerator is attested, and the requested computation is technically supported, but the requester is not entitled to export the requested quantity or category of SMI. Authentication identifies a principal; attestation establishes properties of an environment; neither fact alone necessarily grants final authority for every subsequent release.</t>
+      </section>
+      <section anchor="accumulation">
+        <name>Accumulation and Rollback</name>
+        <t>Extraction risk can be cumulative. A single privileged output may reveal little, while thousands or millions of observations may create a valuable imitation or distillation corpus. Release decisions can therefore depend on previous extraction quantity, output class, model identity, requester, destination, security epoch, policy version, and consumed authorization state.</t>
+        <t>If extraction state exists only in rollbackable software, an attacker may attempt to restore an older virtual-machine snapshot, restart a process, fork concurrent execution, replay a previous authorization, or otherwise cause the release path to observe stale state.</t>
+      </section>
+      <section anchor="alternate-egress">
+        <name>Alternate-Egress and Bypass</name>
+        <t>A control located on only one API or memory interface is insufficient if equivalent SMI can leave through a different path. Relevant paths can include host-visible memory, DMA, PCIe, accelerator interconnects, peer-device transfer, debugger or diagnostic facilities, telemetry, shared memory, storage, and network-facing services.</t>
+        <t>The architectural problem is therefore not merely to check a counter. It is to ensure that all controlled paths capable of converting protected SMI into externally usable information either traverse the applicable Finality Sink or remain technically subordinate to the same release decision.</t>
+      </section>
+    </section>
+
+    <section anchor="existing-solutions">
+      <name>Existing Mechanisms and the Remaining Gap</name>
+      <section anchor="authn-authz">
+        <name>Authentication and Authorization</name>
+        <t>Identity, workload credentials, API keys, access-control lists, role-based controls, and scoped authorization remain necessary. They can determine who may invoke a service or operation. The remaining question is whether the authorization is sufficiently bound to the exact SMI release, destination, extraction state, and security epoch at the point where external effect occurs.</t>
+      </section>
+      <section anchor="rate-limits">
+        <name>Rate Limits, Quotas, and Output Minimization</name>
+        <t>Rate limiting and limiting exposure of high-resolution outputs can reduce extraction opportunities. These controls can remain above the execution-finality layer. However, a service-layer quota does not by itself demonstrate that privileged local software, stale state, concurrency races, or alternate egress paths cannot bypass the intended restriction.</t>
+      </section>
+      <section anchor="monitoring">
+        <name>Monitoring, Audit, and Watermarking</name>
+        <t>Monitoring, audit trails, behavioral detection, and watermarking can identify suspicious behavior or support attribution. Their security role is different when evidence is produced after the sensitive information has already escaped. The architecture in this document is pre-effectuation: the desired denial occurs before the controlled release becomes externally usable.</t>
+      </section>
+      <section anchor="confidential-attestation">
+        <name>Confidential Computing and Platform Attestation</name>
+        <t>Confidential computing can protect workloads and data against portions of the surrounding host environment. RATS can communicate and appraise Evidence about those environments. The trustworthy device-assignment work <xref target="I-D.poirier-rats-eat-da"/> and the TDX plus confidential-GPU EAR profile <xref target="I-D.kykdxy-rats-tdx-cgpu-ear-profile"/> illustrate current work for accelerators and composite confidential-computing environments.</t>
+        <t>These mechanisms establish trust in the environment: that a stated accelerator, firmware, or composite platform is in an expected, measured state. They are evaluated at session or workload establishment, not at each candidate release of sensitive model information. This document does not compete with that layer; it consumes it. Platform attestation can be an input to Protected Validation (<xref target="protected-validation"/>), but a favorable Attestation Result about the platform is not itself a statement that a specific pending release is currently authorized.</t>
+      </section>
+      <section anchor="air-aep">
+        <name>Relationship to Inference Receipts and Action Evidence</name>
+        <t>Two lines of current RATS-adjacent work address related ground and warrant explicit comparison, because a reader could otherwise reasonably ask whether this document is simply a policy gate bolted onto them.</t>
+        <t>The Attested Inference Receipt (AIR) work <xref target="I-D.tsyrulnikov-rats-attested-inference-receipt"/> defines a signed, attestation-linked artifact binding model identity, input/output hashes, and operational telemetry to a completed single inference, with a monotonically increasing sequence claim that lets a downstream verifier detect a gap. Application-layer action evidence work <xref target="I-D.sokolov-rats-aep-composition"/> defines a signed action record binding an action, the authority under which it was taken, and its outcome, composed with platform Evidence for later verification by a Relying Party or Audit Consumer.</t>
+        <t>Both are evidentiary artifacts: they are well-formed once the action or inference has already taken effect, and their value is realized by a party that consumes them afterward. Neither defines a mechanism whose absence, incompleteness, or failed verification prevents the underlying inference or action from occurring or from becoming externally visible through the ordinary response path. A missing AIR receipt does not, by itself, stop an inference result from being returned to the caller; an unverified AEP authority reference does not, by itself, stop the recorded action from having already occurred. Detection in these models is necessarily retrospective: sequence gaps and unresolved authority references are found by a verifier examining the record after the fact, not enforced by a gate the record must clear beforehand.</t>
+        <t>This document addresses an earlier and narrower question: whether a specific proposed release of sensitive model information may become externally effective at all. Execution finality is a precondition on effect, not a description of effect after the fact. <xref target="protected-validation"/> through <xref target="finality-sink"/> define a decision that must succeed before the protected-to-unprotected boundary is crossed; failure results in no release through the governed path, independent of whether any receipt or action record is subsequently produced. This is the property named R1 and R7 in <xref target="requirements"/>: computation is not authority to release, and failure to validate results in no protected external effect. Neither AIR nor the AEP composition model defines an equivalent fail-closed, pre-effectuation gate, and neither defines the rollback-resistant, cumulative extraction state (R3, R4) that this document treats as required once release decisions depend on prior releases rather than a single event.</t>
+        <t><xref target="comparison-table"/> summarizes the distinction along the dimensions most relevant to a reviewer deciding whether this document duplicates existing work.</t>
+        <table anchor="comparison-table">
+          <name>Comparison Along Key Dimensions</name>
+          <thead>
+            <tr>
+              <th>Dimension</th>
+              <th>TDX/cGPU EAR Profile</th>
+              <th>AIR</th>
+              <th>AEP Composition</th>
+              <th>This Document</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>When evaluated</td>
+              <td>Session or workload establishment</td>
+              <td>At or after inference completion</td>
+              <td>After (or concurrent with) the action</td>
+              <td>Before the release becomes externally effective</td>
+            </tr>
+            <tr>
+              <td>What it establishes</td>
+              <td>Platform/environment is in an expected state</td>
+              <td>This inference occurred, bound to platform state</td>
+              <td>This action occurred under a claimed authority</td>
+              <td>This specific pending release currently has verified authority</td>
+            </tr>
+            <tr>
+              <td>Enforcement or record</td>
+              <td>Trust basis; not a release gate</td>
+              <td>Evidentiary record</td>
+              <td>Evidentiary record</td>
+              <td>Active gate; fails closed</td>
+            </tr>
+            <tr>
+              <td>Effect of missing or failed check</td>
+              <td>Attestation fails; unrelated to per-release effect</td>
+              <td>Receipt missing or gap detectable, after release already occurred</td>
+              <td>Authority reference unresolved, after action already occurred</td>
+              <td>Release denied; SMI does not cross the boundary</td>
+            </tr>
+            <tr>
+              <td>Cumulative or rollback state</td>
+              <td>Not addressed</td>
+              <td>Per-session sequence number for gap detection; not authority-consuming</td>
+              <td>Not addressed</td>
+              <td>Rollback-resistant, authority-consuming extraction state required (R3, R4)</td>
+            </tr>
+            <tr>
+              <td>Composability with this document</td>
+              <td>Consumed as input to Protected Validation</td>
+              <td>Can be emitted describing a completed, authorized release</td>
+              <td>Can record the Finality decision's outcome as an action</td>
+              <td>N/A</td>
+            </tr>
+          </tbody>
+        </table>
+        <t>Receipts and action records therefore remain useful, and are not displaced by this document: they can supply audit trails, support attribution, and be composed with the Finality Sink's decision as their subject. But they are complementary outputs of, or inputs to, the release-control problem, not solutions to it. A Verifier that only appraises AIR or AEP artifacts can determine that an unauthorized release probably happened; it cannot itself have prevented that release from taking effect.</t>
+        <t>Of the three, the AEP composition model <xref target="I-D.sokolov-rats-aep-composition"/> is the closest adjacent architecture, because it already separates an action from the authority under which it was taken and records durable, composable evidence of that authority's use. It is not dismissed here as unrelated; it is the natural point of comparison. The distinction is narrower than "evidence versus no evidence": an AEP record can faithfully capture that a release occurred and under what claimed authority, and still be entirely consistent with that release having been unauthorized. Correct, complete evidence of an improper release is not the same artifact as a mechanism that kept the release from occurring. This document requires the latter for sensitive model information; AEP, by design, supplies the former.</t>
+      </section>
+      <section anchor="not-a-policy-gate">
+        <name>Why This Is Not Merely a Policy Gate Added to Attestation</name>
+        <t>Given the overlap discussed above, a reviewer could reasonably suspect that this document reduces to attaching an authorization check near an existing attestation or receipt flow. It does not, and the difference is falsifiable rather than rhetorical: a candidate design satisfies execution finality as defined in this document only if it survives the following tests, each grounded in the requirements of <xref target="requirements"/>.</t>
+        <ul>
+          <li>If the decision can be bypassed through an alternate DMA, API, debug, or peer-GPU route that does not traverse the same decision, it is not execution finality (R6).</li>
+          <li>If the extraction counter or state merely records activity without controlling whether release occurs, it is not extraction finality (R1, R7).</li>
+          <li>If authorization is checked upstream but the actual egress path does not independently enforce that authorization at the boundary, it is not Finality Sink enforcement (R7).</li>
+          <li>If a previously used authorization can be replayed, restored via rollback, or reapplied to a materially different output, destination, or epoch, it does not satisfy the release-finality property this document requires (R3, R5).</li>
+        </ul>
+        <t>A design that adds an authorization check without closing alternate egress paths, without making the check load-bearing at the point of external effect, and without rollback and replay resistance on the state that gates cumulative release, is a policy gate in the ordinary sense already achievable with existing authorization and quota mechanisms (<xref target="authn-authz"/>, <xref target="rate-limits"/>). It is not what this document describes, and it would not satisfy R1 through R7.</t>
+        <t>Stated concisely: Evidence may establish what system ran, what authority existed, or what action occurred. Execution finality determines whether this particular sensitive model-state release is technically capable of becoming externally effective at all.</t>
+      </section>
+    </section>
+
+    <section anchor="architecture">
+      <name>Execution-Finality Architecture</name>
+      <t>The architecture separates the production of SMI from authority for that information to become externally usable.</t>
+      <figure>
+        <name>Conceptual Release Flow</name>
+        <artwork type="ascii-art"><![CDATA[
+   +--------------------------+
+   |  Attested AI Workload    |
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Model computes SMI       |
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Candidate Release        |
+   | (non-effective outside)  |
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Protected Validation     |
+   | scope / destination /    |
+   | policy / epoch / state   |
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Atomic extraction-state  |
+   | reservation / consume    |
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Bounded Release Authority|
+   +------------+-------------+
+                |
+                v
+   +--------------------------+
+   | Finality Sink verifies   |
+   +-------+------------------+
+           | valid      | invalid
+           v            v
+     RELEASE SMI      DENY / FAIL CLOSED
+]]></artwork>
+      </figure>
+
+      <section anchor="candidate-release">
+        <name>Candidate Release</name>
+        <t>A Candidate Release represents a proposed externally effective transfer of SMI. It can commit to load-bearing attributes such as model identity, workload identity, requester or principal, output class, destination, quantity, policy identifier, security epoch, nonce, and applicable extraction state.</t>
+        <t>The Candidate Release remains non-effective with respect to the intended external recipient until the release-control procedure succeeds.</t>
+      </section>
+
+      <section anchor="protected-validation">
+        <name>Protected Validation</name>
+        <t>The validator evaluates whether the proposed release remains within the applicable policy and current state. Deployment-specific inputs can include model identity, output category, requester, destination, cumulative extraction state, policy epoch, revocation state, and whether the same authority has already been consumed.</t>
+      </section>
+
+      <section anchor="monotonic-state">
+        <name>Rollback-Resistant Extraction State</name>
+        <t>Where cumulative extraction matters, the architecture can use a hardware-isolated or otherwise strongly protected monotonic state, secure epoch, sealed state, protected consumption record, or equivalent mechanism. The required property is not a particular counter implementation; it is that restoring older application or virtual-machine state cannot recreate already-consumed extraction authority.</t>
+        <figure>
+          <name>Conceptual Protected Extraction State</name>
+          <artwork type="ascii-art"><![CDATA[
+  protected state:  97 -> 98 -> 99 -> 100 -> DENY
+
+  prohibited rollback:
+                    100 -X-> 20
+]]></artwork>
+        </figure>
+      </section>
+
+      <section anchor="bounded-authority">
+        <name>Bounded Non-Bearer Release Authority</name>
+        <t>Release authority should be bound to the Candidate Release or to a narrowly defined class of releases rather than operate as a generic transferable bearer credential. For example, authority for Model A, output class C, destination D, epoch E, and extraction state F should not automatically authorize a materially different model, output category, destination, or epoch.</t>
+      </section>
+
+      <section anchor="finality-sink">
+        <name>Finality Sink</name>
+        <t>The Finality Sink is the first controlled boundary at which SMI can become usable by the intended external or less-trusted domain. Depending on the implementation, it could be realized in accelerator firmware, protected DMA control, a memory or interconnect egress controller, a trusted device boundary, a TEE-hosted serving component, or another protected release mechanism.</t>
+        <t>The defining property is not physical placement. It is that no controlled external release through the governed path becomes effective without successful verification of current release authority.</t>
+      </section>
+    </section>
+
+    <section anchor="requirements">
+      <name>Desired Security Properties</name>
+      <dl newline="true">
+        <dt>R1 - Computation/Release Separation</dt>
+        <dd>Successful computation of SMI does not by itself authorize external release.</dd>
+        <dt>R2 - Release-Specific Binding</dt>
+        <dd>Release authority is bound to the load-bearing attributes relevant to the deployment, such as model, output class, destination, epoch, and extraction state.</dd>
+        <dt>R3 - Rollback Resistance</dt>
+        <dd>Already-consumed or advanced extraction state cannot be restored merely by rolling back ordinary software, process, container, or virtual-machine state.</dd>
+        <dt>R4 - Atomic Reservation or Consumption</dt>
+        <dd>Where a quota or single-use authority is involved, concurrent requests cannot independently consume the same final remaining authority.</dd>
+        <dt>R5 - Replay Resistance</dt>
+        <dd>A previously accepted release authority cannot be reused for a materially new Candidate Release.</dd>
+        <dt>R6 - Alternate-Path Closure</dt>
+        <dd>Equivalent protected SMI cannot become externally usable through an alternate controlled path that avoids the same release decision.</dd>
+        <dt>R7 - Fail-Closed Controlled Release</dt>
+        <dd>Failure to validate required authority or protected state results in no protected external effect through the governed release path.</dd>
+        <dt>R8 - Attestable Enforcement State</dt>
+        <dd>A remote Relying Party can, where the deployment requires it, obtain Evidence or Attestation Results sufficient to reason about whether the expected release-control mechanism and relevant security state are active.</dd>
+      </dl>
+    </section>
+
+    <section anchor="real-world-scenario">
+      <name>Real-World Scenario</name>
+      <t>Consider a frontier-model provider that runs a proprietary model on a confidential GPU cluster. An enterprise evaluation partner is authenticated and is permitted to query the model. For a limited evaluation task, the partner is also permitted to obtain at most 100 high-resolution log-probability responses. The partner is not authorized to obtain unlimited privileged model information.</t>
+      <section anchor="scenario-normal">
+        <name>Authorized Release Number 100</name>
+        <t>The protected extraction state records 99 previous privileged releases. The model computes another log-probability response. The result exists inside the protected domain but is treated as a Candidate Release rather than automatically returned.</t>
+        <t>The validator checks the model identity, workload, output class, destination, authorization state, security epoch, and current extraction state. If all checks succeed, the remaining extraction authorization is atomically reserved, moving the protected state from 99 to 100. A release authority bound to the specific Candidate Release is then accepted at the Finality Sink, and the information becomes externally available.</t>
+      </section>
+      <section anchor="scenario-101">
+        <name>Attempted Release Number 101</name>
+        <t>The partner submits another privileged request. The model may still compute the requested information internally. The validator now observes that the protected extraction allowance is exhausted. No valid release authority is produced.</t>
+        <t>The important outcome is not that computation failed. The outcome is that the computed SMI remains non-effective outside the controlled boundary:</t>
+        <blockquote><t>No valid release authority means no protected external release through the governed Finality path.</t></blockquote>
+      </section>
+      <section anchor="scenario-rollback">
+        <name>Snapshot Rollback</name>
+        <t>An attacker restores an application or virtual-machine snapshot in which ordinary software reports only 20 previous releases. The protected extraction state still reflects 100. The stale application state therefore does not recreate extraction authority.</t>
+      </section>
+      <section anchor="scenario-replay">
+        <name>Replay</name>
+        <t>An attacker replays the authority used for release 100. The Finality Sink or protected validator observes that the relevant authority is consumed, stale, or inconsistent with current extraction state and denies the release.</t>
+      </section>
+      <section anchor="scenario-concurrency">
+        <name>Concurrent Requests</name>
+        <t>If two requests arrive while only one privileged release remains, atomic reservation or consumption permits at most one of the requests to advance the protected state. The other request observes the exhausted state and cannot independently reuse the same remaining allowance.</t>
+      </section>
+      <section anchor="scenario-bypass">
+        <name>Alternate-Egress Attempt</name>
+        <t>If an attacker attempts to export the same SMI through DMA, peer-GPU transfer, debugging, diagnostics, shared host memory, or another controlled interface, the architecture is complete only if that path is also governed by the Finality decision or cannot expose the protected information. An ungoverned equivalent path is an anti-bypass failure.</t>
+      </section>
+    </section>
+
+    <section anchor="distillation">
+      <name>Relationship to Unauthorized Distillation</name>
+      <t>Model distillation can use a higher-capability teacher model to produce supervision for a student model. Ordinary final answers can provide such supervision, but richer teacher signals can expose substantially more information about relative alternatives and internal representations.</t>
+      <t>For example, a normal interface may return only the selected output, while a privileged interface may return a full probability distribution. Repeated extraction of full logits, detailed log probabilities, embeddings, hidden states, activations, or other privileged artifacts can create a substantially richer training corpus for imitation or reconstruction.</t>
+      <figure>
+        <name>Unauthorized Extraction as a Distillation Path</name>
+        <artwork type="ascii-art"><![CDATA[
+  Teacher / Frontier Model
+           |
+           | privileged high-information state
+           v
+  Unauthorized Extraction
+           |
+           | accumulated teacher signals
+           v
+  High-Value Training Corpus
+           |
+           v
+  Student Model / Imitation / Distillation
+]]></artwork>
+      </figure>
+      <t>The architecture in this document attacks the first transition. If privileged information is computed but the specific release is not authorized, the Finality Sink denies external effect. The unauthorized party therefore cannot accumulate that protected teacher signal through the governed path.</t>
+      <t>This does not prevent a party from training on ordinary outputs that the provider deliberately and legitimately exposes. The claim is narrower: extraction-control can reduce an important pathway by which unauthorized access to richer-than-normal teacher signals improves the efficiency, fidelity, or economics of model stealing, reconstruction, imitation, or distillation.</t>
+    </section>
+
+    <section anchor="rats-composition">
+      <name>Relationship to RATS</name>
+      <t>Execution finality does not replace RATS. RATS can provide the interoperable trust layer by which a remote model owner or Relying Party determines whether the expected release-control mechanism is present and operating in an acceptable state.</t>
+      <t>A future profile could potentially expose claims or Attestation Results concerning release-control capability, policy or configuration identity, protected extraction-state mechanism, active security epoch, anti-rollback properties, or other assurance-relevant state. <xref target="rats-interop-profile"/> sketches illustrative claim semantics; this document does not request claim-number assignment or define a protocol.</t>
+      <t>The distinction is:</t>
+      <ul>
+        <li>Platform attestation asks whether the relevant execution environment is in an acceptable state.</li>
+        <li>Release finality asks whether this specific SMI release has current authority to become externally effective.</li>
+        <li>Receipts or action evidence can record what occurred and can be composed with platform Evidence for later verification.</li>
+      </ul>
+      <t>Epoch Markers <xref target="I-D.ietf-rats-epoch-markers"/> may be relevant where a deployment needs a shared freshness generation across distributed participants. The exact relationship between an Epoch Marker and protected extraction state is left for future work.</t>
+    </section>
+
+    <section anchor="rats-interop-profile">
+      <name>Concrete RATS Interoperability Profile for Model-State Release Control</name>
+      <t>This section sketches how the release-control properties described in this document could be made remotely verifiable through existing RATS building blocks rather than through a new standalone attestation protocol. It supersedes the deferral in <xref target="rats-composition"/> only to the extent of proposing illustrative claim semantics; it does not request claim-number assignment and does not define a protocol.</t>
+      <t>The proposed approach is to represent release-control properties as claims in Evidence or an Attestation Result, using EAT-compatible claim semantics where appropriate, carrying such information in a CWT or equivalent structure, and protecting the resulting object using COSE mechanisms.</t>
+      <t>The purpose of these claims is not to authorize model-state release directly. Their purpose is to allow a Verifier or Relying Party to determine whether the attested environment implements the required release-control properties before relying upon that environment.</t>
+      <t>A possible architecture is:</t>
+      <figure>
+        <name>Attestation Path for Release-Control Properties</name>
+        <artwork type="ascii-art"><![CDATA[
+Attester
+  -> Evidence containing release-control claims
+  -> Verifier
+  -> Attestation Result containing verified release-control properties
+  -> Relying Party
+]]></artwork>
+      </figure>
+      <t>The protected release path remains separate:</t>
+      <figure>
+        <name>Protected Release Path</name>
+        <artwork type="ascii-art"><![CDATA[
+Model Computation
+  -> Candidate Release
+  -> Protected Validation
+  -> Protected Extraction-State Transition
+  -> Bounded Release Authority
+  -> Finality Sink Verification
+  -> External Release
+]]></artwork>
+      </figure>
+      <t>The distinction is important. The RATS object communicates evidence about the presence and state of the release-control mechanism. The bounded Release Authority remains the act-specific mechanism that determines whether a particular Candidate Release may cross the protected-to-unprotected boundary.</t>
+
+      <section anchor="candidate-claims">
+        <name>Candidate Release-Control Claims</name>
+        <t>A future RATS profile could define claims semantically equivalent to the following.</t>
+        <table anchor="candidate-claims-table">
+          <name>Candidate Release-Control Claims</name>
+          <thead>
+            <tr><th>Claim</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><tt>release_control_profile</tt></td><td>Identifies the release-control profile implemented by the attested environment.</td></tr>
+            <tr><td><tt>release_control_enabled</tt></td><td>Indicates whether protected model-state release control is currently enabled.</td></tr>
+            <tr><td><tt>release_control_measurement</tt></td><td>Identifies or commits to the measured implementation of the release-control mechanism.</td></tr>
+            <tr><td><tt>model_identity</tt></td><td>Identifies or cryptographically commits to the protected model to which the release-control state applies.</td></tr>
+            <tr><td><tt>release_policy_id</tt></td><td>Identifies the active policy governing protected model-state release.</td></tr>
+            <tr><td><tt>security_epoch</tt></td><td>Identifies the current security or authorization epoch.</td></tr>
+            <tr><td><tt>extraction_state_id</tt></td><td>Identifies the protected extraction-state object or state domain.</td></tr>
+            <tr><td><tt>extraction_state_commitment</tt></td><td>Provides a protected commitment to the relevant extraction state without necessarily disclosing the raw counter or usage history.</td></tr>
+            <tr><td><tt>rollback_protection</tt></td><td>Indicates whether the relevant extraction state is protected against rollback, cloning, snapshot restoration, or equivalent state regression.</td></tr>
+            <tr><td><tt>finality_sink_id</tt></td><td>Identifies the protected Finality Sink or sink instance responsible for enforcing release.</td></tr>
+            <tr><td><tt>finality_sink_class</tt></td><td>Identifies the class of controlled boundary, such as accelerator egress, HBM controller, DMA controller, protected API egress, or network egress.</td></tr>
+            <tr><td><tt>destination_binding_supported</tt></td><td>Indicates whether release authority can be bound to a specific destination or receiving security domain.</td></tr>
+            <tr><td><tt>authority_consumption_mode</tt></td><td>Describes whether release authority is single-use, quota-bound, window-bound, state-consuming, or otherwise bounded.</td></tr>
+            <tr><td><tt>alternate_egress_control</tt></td><td>Indicates whether alternate protected-to-unprotected paths are subject to the same release-control decision.</td></tr>
+            <tr><td><tt>release_control_assurance</tt></td><td>Expresses the assurance level or implementation class associated with the release-control mechanism.</td></tr>
+          </tbody>
+        </table>
+        <t>These names are illustrative and do not constitute requested EAT or CWT claim-number assignments.</t>
+      </section>
+
+      <section anchor="example-claims">
+        <name>Example Attestation Claim Set</name>
+        <t>The following example is intentionally illustrative:</t>
+        <sourcecode type="json" markers="false"><![CDATA[
+{
+  "release_control_profile": "model-state-finality-v1",
+  "release_control_enabled": true,
+  "model_identity": "sha256:MODEL_MEASUREMENT",
+  "release_policy_id": "policy-frontier-model-17",
+  "security_epoch": 42,
+  "extraction_state_id": "extract-state-model-17",
+  "extraction_state_commitment": "sha256:STATE_COMMITMENT",
+  "rollback_protection": true,
+  "finality_sink_id": "gpu-egress-sink-04",
+  "finality_sink_class": "ACCELERATOR_EGRESS",
+  "destination_binding_supported": true,
+  "authority_consumption_mode": "ATOMIC_STATE_CONSUMPTION",
+  "alternate_egress_control": true,
+  "release_control_assurance": "HARDWARE_PROTECTED"
+}
+]]></sourcecode>
+        <t>A Verifier receiving Evidence containing these claims would not merely determine that a GPU or confidential-computing environment is genuine. It could determine that the measured environment claims support for a particular class of protected release enforcement.</t>
+        <t>The Verifier could then produce an Attestation Result stating, for example, that:</t>
+        <ul>
+          <li>the expected release-control implementation is active;</li>
+          <li>the expected model identity is present;</li>
+          <li>the current security epoch is acceptable;</li>
+          <li>rollback-resistant extraction state is supported;</li>
+          <li>the expected Finality Sink is present;</li>
+          <li>alternate protected egress paths are subject to release control; and</li>
+          <li>act-specific Release Authority is required before sensitive state may cross the controlled boundary.</li>
+        </ul>
+      </section>
+
+      <section anchor="cwt-cose-carriage">
+        <name>CWT and COSE Carriage</name>
+        <t>Where CBOR-based deployment is appropriate, the release-control claims may be carried in a CWT or another CBOR-based attestation structure.</t>
+        <t>COSE can provide integrity protection, authentication, signatures, MACs, encryption, or combinations thereof according to the applicable deployment profile.</t>
+        <t>This document does not require that the act-specific Release Authority itself be an EAT.</t>
+        <t>A deployment may therefore use two distinct protected objects:</t>
+        <ol type="1">
+          <li>an attestation object establishing that the platform implements the required release-control mechanism; and</li>
+          <li>an act-specific bounded Release Authority that permits one particular Candidate Release or bounded release class to cross the Finality Sink.</li>
+        </ol>
+        <t>Conflating these objects would weaken the architecture. Platform Evidence establishes properties of the environment. Release Authority governs the particular externally effective release.</t>
+      </section>
+
+      <section anchor="epoch-state-relationship">
+        <name>Relationship to Epoch State</name>
+        <t>The <tt>security_epoch</tt> claim allows a Verifier or Relying Party to determine whether Evidence or an Attestation Result corresponds to an acceptable current authorization state.</t>
+        <t>An implementation may advance the security epoch when significant release-control state changes occur, including:</t>
+        <ul>
+          <li>policy replacement;</li>
+          <li>model replacement;</li>
+          <li>revocation;</li>
+          <li>Finality Sink replacement;</li>
+          <li>extraction-state reset under an authorized maintenance procedure;</li>
+          <li>firmware or release-control implementation change; or</li>
+          <li>compromise recovery.</li>
+        </ul>
+        <t>An act-specific Release Authority bound to an earlier epoch should not automatically remain valid after a security-relevant epoch transition.</t>
+        <t>The epoch therefore provides a freshness and revocation domain, but it does not substitute for act-specific nonce, replay, consumption, extraction-budget, or Finality Sink state.</t>
+      </section>
+
+      <section anchor="privacy-preserving-state">
+        <name>Privacy-Preserving State Representation</name>
+        <t>A RATS profile should not require disclosure of sensitive operational information merely to prove that release control exists.</t>
+        <t>For example, exposing an exact extraction counter could reveal:</t>
+        <ul>
+          <li>customer activity;</li>
+          <li>model utilization;</li>
+          <li>tenant behavior;</li>
+          <li>privileged-query volume; or</li>
+          <li>internal security-policy thresholds.</li>
+        </ul>
+        <t>The attested object may therefore expose a commitment, range, policy-state identifier, acceptable/not-acceptable result, or other privacy-preserving representation rather than the raw extraction value.</t>
+        <t>A Verifier may validate the protected state internally and communicate only the minimum Attestation Result required by the Relying Party.</t>
+      </section>
+
+      <section anchor="what-rats-standardizes">
+        <name>What RATS Would Standardize</name>
+        <t>The proposed standardization target is therefore not a GPU microarchitecture, proprietary model-serving system, model-weight format, or vendor-specific extraction counter.</t>
+        <t>The useful RATS interoperability surface is the machine-verifiable statement that an attested execution environment implements a specified protected model-state release-control profile, maintains required protected state and epoch semantics, and places the relevant externally usable release paths under an identifiable Finality Sink requiring current bounded release authority.</t>
+        <t>This allows a model owner, cloud provider, confidential-computing platform, enterprise customer, or other Relying Party to distinguish "the accelerator is authentic" from the stronger property "the accelerator is authentic and is currently enforcing the expected protected model-state release-finality mechanism."</t>
+      </section>
+    </section>
+
+    <section anchor="latency">
+      <name>Latency and Performance Feasibility</name>
+      <t>A practical model-serving system cannot require a remote attestation round trip for every generated token. The architecture therefore separates slower provisioning and trust establishment from a local release fast path.</t>
+      <t>No universal latency figure is asserted. Performance depends on hardware, persistence model, concurrency, state-protection mechanism, evidence generation, and deployment policy. A standards document should specify interoperable semantics and assurance properties rather than assume a particular vendor's microarchitectural latency.</t>
+      <section anchor="slow-path">
+        <name>Slow Path</name>
+        <t>The slow path can perform initial or periodic platform attestation, model registration, policy provisioning, workload authorization, key establishment, security-epoch initialization, and extraction-budget assignment.</t>
+      </section>
+      <section anchor="fast-path">
+        <name>Fast Path</name>
+        <t>The fast path can remain local to the accelerator, trusted firmware, TEE, or protected host-device boundary. It can classify the Candidate Release, compare current protected state, validate locally provisioned scope, atomically reserve or consume authority, and release or deny without a network round trip.</t>
+      </section>
+      <section anchor="classification">
+        <name>Not Every Output Requires the Same Control</name>
+        <t>Deployments can classify output types. Ordinary permitted completion text may use the normal serving path, while high-resolution log-probability requests, hidden-state export, activation dumps, or privileged diagnostics can use the stronger extraction-sensitive path. This avoids imposing the strongest state transition on every token where it is unnecessary.</t>
+      </section>
+    </section>
+
+    <section anchor="legacy">
+      <name>Legacy and Incremental Deployment</name>
+      <t>The architecture can be deployed in stages with increasing assurance.</t>
+      <ol>
+        <li><t><strong>Software gateway:</strong> existing inference services classify privileged exports and apply release-specific authorization, quotas, destination restrictions, replay protection, and logging. This provides useful semantics but weaker anti-bypass assurance.</t></li>
+        <li><t><strong>TEE or confidential-computing enforcement:</strong> validation state and release decisions move inside an attested protected environment, reducing reliance on an untrusted host.</t></li>
+        <li><t><strong>Accelerator or protected firmware enforcement:</strong> extraction state and release checks move closer to device egress, reducing driver and host bypass opportunities.</t></li>
+        <li><t><strong>Silicon-backed enforcement:</strong> future accelerators may expose dedicated protected primitives for monotonic state, atomic consumption, model-bound state, egress verification, or release evidence.</t></li>
+      </ol>
+      <t>Existing APIs need not change their externally visible function names. An operation such as ReturnLogProbs() can remain an application-level call while the implementation internally transforms it into Candidate Release, protected validation, Finality decision, and existing API response.</t>
+    </section>
+
+    <section anchor="industrial-relevance">
+      <name>Industrial Relevance</name>
+      <section anchor="frontier-providers">
+        <name>Frontier-Model Providers</name>
+        <t>Providers of proprietary frontier models, including systems such as OpenAI GPT-class and Anthropic Claude-class models, have direct incentives to protect model capabilities and privileged internal information. The architecture is especially relevant where selected partners, researchers, internal systems, evaluators, or enterprise tenants are allowed access to interfaces richer than ordinary end-user output.</t>
+      </section>
+      <section anchor="cloud-providers">
+        <name>Cloud AI Infrastructure</name>
+        <t>A model owner deploying on infrastructure outside its physical control may want more than proof that the expected GPU and workload are present. It may also want verifiable assurance that the deployment enforces the owner's protected model-release policy before SMI can leave the trusted domain.</t>
+      </section>
+      <section anchor="silicon-vendors">
+        <name>Accelerator and Semiconductor Vendors</name>
+        <t>GPU, NPU, AI-accelerator, chiplet, interconnect, and confidential-computing vendors can potentially expose protected primitives for extraction state, release authorization, atomic state transitions, egress enforcement, and Evidence generation. This document deliberately avoids prescribing a specific silicon layout.</t>
+      </section>
+      <section anchor="enterprise-sovereign">
+        <name>Enterprise and Sovereign AI</name>
+        <t>Enterprises and sovereign operators may deploy proprietary financial, engineering, scientific, industrial, public-sector, or other high-value models in shared or outsourced infrastructure. Attestable release control can provide an additional mechanism for enforcing destination, workload, model, output-class, and extraction-state policies across administrative boundaries.</t>
+      </section>
+    </section>
+
+    <section anchor="standardization">
+      <name>Potential Standardization Boundaries</name>
+      <t>The IETF need not standardize an accelerator's internal silicon layout. The interoperable problem is how independent model owners, accelerators, cloud operators, workloads, Verifiers, and Relying Parties communicate and appraise the state relevant to protected release control.</t>
+      <t>Potential future standardization work could define semantics for:</t>
+      <ul>
+        <li>model or protected-artifact identity;</li>
+        <li>release class;</li>
+        <li>release-policy identifier;</li>
+        <li>extraction-state or consumption-state identifier;</li>
+        <li>security epoch;</li>
+        <li>destination binding;</li>
+        <li>release-control capability;</li>
+        <li>release-control assurance level; and</li>
+        <li>evidence that the expected protected release mechanism is active.</li>
+      </ul>
+      <t>Existing EAT, CWT, COSE, RATS, and related mechanisms should be reused where they already provide the required semantics. New claims or containers should be proposed only after the working group determines that an interoperability gap remains.</t>
+    </section>
+
+    <section anchor="illustrative-algorithm">
+      <name>Illustrative Release Decision</name>
+      <t>The following pseudocode is non-normative and illustrates the state ordering intended by this document. It is not a prescribed implementation.</t>
+      <figure>
+        <name>Non-Normative Release-Finality Pseudocode</name>
+        <sourcecode type="pseudocode" markers="false"><![CDATA[
+function attempt_sensitive_release(candidate):
+    attrs = canonicalize(candidate.load_bearing_attributes)
+
+    if not protected_policy.allows(attrs):
+        return DENY
+
+    state = protected_extraction_state.read(attrs.scope_key)
+
+    if state.epoch != attrs.epoch:
+        return DENY
+
+    if state.exhausted(attrs.release_class):
+        return DENY
+
+    reservation = protected_extraction_state.atomic_reserve(
+        scope_key = attrs.scope_key,
+        release_class = attrs.release_class,
+        candidate_digest = digest(attrs))
+
+    if reservation.failed:
+        return DENY
+
+    authority = bind_release_authority(
+        candidate_digest = digest(attrs),
+        reservation = reservation,
+        destination = attrs.destination,
+        epoch = attrs.epoch)
+
+    if not finality_sink.verify(authority, attrs):
+        protected_extraction_state.poison_or_resolve(reservation)
+        return DENY
+
+    result = finality_sink.effect_release(candidate.payload)
+    protected_extraction_state.finalize(reservation, result)
+    return result
+]]></sourcecode>
+      </figure>
+      <t>A production design must specify crash recovery, reservation timeout, durable commit ordering, partial-failure semantics, multi-device synchronization, and whether a failed or uncertain dispatch poisons the associated authority. Those details are deliberately not hidden by the simplified pseudocode and require protocol-specific work.</t>
+    </section>
+
+    <section anchor="security">
+      <name>Security Considerations</name>
+      <t>The architecture is ineffective if sensitive information can leave through an ungoverned equivalent path. Implementations need an explicit inventory of protected-to-unprotected transitions and a closure argument for each relevant egress path.</t>
+      <t>Threats include rollback, replay, concurrent double consumption, stale epochs, destination substitution, policy downgrade, authorization widening, compromised drivers, privileged-host compromise, malicious or vulnerable firmware, debugger and telemetry bypass, DMA bypass, peer-device transfer, state desynchronization, verifier compromise, attestation-key compromise, side channels, covert channels, and deliberate exhaustion of extraction budgets.</t>
+      <t>Remote attestation cannot prove a security property that the measured implementation does not actually enforce. A release-control claim is useful only when the Attesting Environment can obtain trustworthy measurements or state from the components responsible for enforcement and when the Verifier has adequate Reference Values and appraisal policy.</t>
+      <t>A monotonic counter alone is not an anti-distillation solution. If ordinary outputs or another interface expose equivalent high-value information, the attacker may simply change extraction path. Security analysis therefore needs to consider information equivalence and alternate paths, not only one counter or one API.</t>
+      <t>Denial-of-service is also possible. An attacker may intentionally consume another principal's extraction budget or force uncertain dispatch state. Deployments should bind state to an appropriate scope and define recovery semantics that do not silently recreate authority.</t>
+    </section>
+
+    <section anchor="privacy">
+      <name>Privacy Considerations</name>
+      <t>Extraction-state and release-control Evidence can reveal sensitive metadata, including customer activity, model usage, business relationships, query volume, workload identity, destinations, and security policy. Evidence should disclose only the information necessary for the Relying Party's appraisal decision.</t>
+      <t>Globally stable identifiers should be avoided where a less-linkable identifier can satisfy the deployment. Detailed extraction histories should not be exposed merely to prove that a limit has not been exceeded. Privacy-preserving appraisal and selective disclosure are desirable where compatible with the required security property.</t>
+    </section>
+
+    <section anchor="iana">
+      <name>IANA Considerations</name>
+      <t>This document has no IANA actions.</t>
+    </section>
+
+    <section anchor="ipr-note">
+      <name>IPR Note</name>
+      <t>This document does not define licensing terms. Any IPR disclosures related to this Internet-Draft are handled through the IETF IPR disclosure process under the applicable IETF rules and are separate from the technical architecture described here.</t>
+      <t>A broader, cross-industry presentation of the same execution-finality principle, published independently of this Internet-Draft series, is available at <xref target="DAS-AUTHORITY"/>.</t>
+    </section>
+
+    <section anchor="conclusion">
+      <name>Conclusion</name>
+      <t>Confidential computing and remote attestation can establish increasingly strong evidence about the environment in which frontier AI computation occurs. The next security question can arise after that trusted computation succeeds: whether a particular sensitive result is authorized to leave.</t>
+      <t>This document frames unauthorized model-state extraction as an execution-finality problem. A workload can be authenticated, a GPU can be attested, and a model can successfully compute SMI while the external release remains unauthorized. By making the release a separate Candidate Act, binding authority to current protected state, preventing rollback and replay, enforcing the decision at the controlled Finality Sink, and making enforcement state attestable, deployments can reduce unauthorized accumulation of privileged model information.</t>
+      <t>The intended rule is simple: compute does not imply release. Where protected model information is concerned, no valid release authority means no protected external effect through the governed Finality path.</t>
+    </section>
+  </middle>
+
+  <back>
+    <references>
+      <name>References</name>
+      <references>
+        <name>Normative References</name>
+        <reference anchor="RFC9334" target="https://www.rfc-editor.org/rfc/rfc9334">
+          <front>
+            <title>Remote ATtestation procedureS (RATS) Architecture</title>
+            <author initials="H." surname="Birkholz" fullname="Henk Birkholz"/>
+            <author initials="D." surname="Thaler" fullname="Dave Thaler"/>
+            <author initials="M." surname="Richardson" fullname="Michael Richardson"/>
+            <author initials="N." surname="Smith" fullname="Ned Smith"/>
+            <author initials="W." surname="Pan" fullname="Wei Pan"/>
+            <date year="2023" month="January"/>
+          </front>
+          <seriesInfo name="RFC" value="9334"/>
+          <seriesInfo name="DOI" value="10.17487/RFC9334"/>
+        </reference>
+        <reference anchor="RFC9711" target="https://www.rfc-editor.org/rfc/rfc9711">
+          <front>
+            <title>The Entity Attestation Token (EAT)</title>
+            <author initials="L." surname="Lundblade" fullname="Laurence Lundblade"/>
+            <author initials="G." surname="Mandyam" fullname="Giridhar Mandyam"/>
+            <author initials="J." surname="O'Donoghue" fullname="Jeremy O'Donoghue"/>
+            <author initials="C." surname="Wallace" fullname="Carl Wallace"/>
+            <date year="2025" month="April"/>
+          </front>
+          <seriesInfo name="RFC" value="9711"/>
+          <seriesInfo name="DOI" value="10.17487/RFC9711"/>
+        </reference>
+      </references>
+      <references>
+        <name>Informative References</name>
+        <reference anchor="I-D.das-rats-frontier-model-extraction" target="https://datatracker.ietf.org/doc/html/draft-das-rats-frontier-model-extraction-02">
+          <front>
+            <title>Beyond Attestation: An Execution-Finality Architecture for Controlling Release and Limiting Unauthorized Extraction and Distillation of Sensitive Frontier AI Model Information</title>
+            <author initials="S." surname="Das" fullname="Sangam Das"/>
+            <date year="2026" month="August"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-das-rats-frontier-model-extraction-02"/>
+          <annotation>Work in Progress. Vendor-neutral companion presentation of the architecture in this document.</annotation>
+        </reference>
+        <reference anchor="I-D.das-agentic-tool-binding" target="https://datatracker.ietf.org/doc/html/draft-das-agentic-tool-binding-02">
+          <front>
+            <title>tool_use Is Not invoke(): Binding Execution-Finality to Agentic Tool-Call Interfaces and MCP</title>
+            <author initials="S." surname="Das" fullname="Sangam Das"/>
+            <date year="2026" month="August"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-das-agentic-tool-binding-02"/>
+          <annotation>Work in Progress. Applies the same execution-finality architecture to agentic tool-call dispatch rather than to release of sensitive model information.</annotation>
+        </reference>
+        <reference anchor="DAS-AUTHORITY" target="https://doi.org/10.5281/zenodo.22082995">
+          <front>
+            <title>The Internet Solved Communication. It Never Solved Authority</title>
+            <author fullname="Sangam Das" initials="S." surname="Das"/>
+            <date year="2026" month="August" day="24"/>
+          </front>
+          <seriesInfo name="DOI" value="10.5281/zenodo.22082995"/>
+        </reference>
+        <reference anchor="RFC10013" target="https://www.rfc-editor.org/rfc/rfc10013">
+          <front>
+            <title>Entity Attestation Token (EAT) Measured Component</title>
+            <author initials="H." surname="Birkholz" fullname="Henk Birkholz"/>
+            <date year="2026" month="July"/>
+          </front>
+          <seriesInfo name="RFC" value="10013"/>
+          <seriesInfo name="DOI" value="10.17487/RFC10013"/>
+        </reference>
+        <reference anchor="I-D.ietf-rats-epoch-markers" target="https://datatracker.ietf.org/doc/html/draft-ietf-rats-epoch-markers-04">
+          <front>
+            <title>Epoch Markers</title>
+            <author initials="H." surname="Birkholz" fullname="Henk Birkholz"/>
+            <author initials="T." surname="Fossati" fullname="Thomas Fossati"/>
+            <author initials="W." surname="Pan" fullname="Wei Pan"/>
+            <author initials="I." surname="Mihalcea" fullname="Ionut Mihalcea"/>
+            <author initials="C." surname="Bormann" fullname="Carsten Bormann"/>
+            <date year="2026" month="May" day="18"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-ietf-rats-epoch-markers-04"/>
+          <annotation>Work in Progress.</annotation>
+        </reference>
+        <reference anchor="I-D.poirier-rats-eat-da" target="https://datatracker.ietf.org/doc/html/draft-poirier-rats-eat-da-10">
+          <front>
+            <title>An EAT Profile for Trustworthy Device Assignment</title>
+            <author initials="M." surname="Poirier" fullname="Mathieu Poirier"/>
+            <author initials="H." surname="Birkholz" fullname="Henk Birkholz"/>
+            <author initials="T." surname="Fossati" fullname="Thomas Fossati"/>
+            <date year="2026" month="June" day="23"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-poirier-rats-eat-da-10"/>
+          <annotation>Work in Progress.</annotation>
+        </reference>
+        <reference anchor="I-D.kykdxy-rats-tdx-cgpu-ear-profile" target="https://datatracker.ietf.org/doc/html/draft-kykdxy-rats-tdx-cgpu-ear-profile-02">
+          <front>
+            <title>TDX and Confidential GPU EAR Profile</title>
+            <author initials="G." surname="Kostal" fullname="Greg Kostal"/>
+            <author initials="R." surname="Yeluri" fullname="Raghuram Yeluri"/>
+            <author initials="D." surname="Kumar" fullname="Dhawal Kumar"/>
+            <author initials="S." surname="Dittakavi" fullname="Sindhuri Dittakavi"/>
+            <author initials="H." surname="Xia" fullname="Haidong Xia"/>
+            <author initials="J." surname="Yu" fullname="Jerry Yu"/>
+            <date year="2026" month="July" day="19"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-kykdxy-rats-tdx-cgpu-ear-profile-02"/>
+          <annotation>Work in Progress. Successor to draft-kdyxy-rats-tdx-eat-profile, extended to cover confidential-GPU EAR claims. Title as filed pending final confirmation against the datatracker page.</annotation>
+        </reference>
+        <reference anchor="I-D.tsyrulnikov-rats-attested-inference-receipt" target="https://datatracker.ietf.org/doc/html/draft-tsyrulnikov-rats-attested-inference-receipt-01">
+          <front>
+            <title>Attested Inference Receipt (AIR): A COSE/CWT Profile for Confidential AI Inference</title>
+            <author initials="B." surname="Tsyrulnikov" fullname="B. Tsyrulnikov"/>
+            <date year="2026" month="March" day="12"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-tsyrulnikov-rats-attested-inference-receipt-01"/>
+          <annotation>Work in Progress.</annotation>
+        </reference>
+        <reference anchor="I-D.sokolov-rats-aep-composition" target="https://datatracker.ietf.org/doc/html/draft-sokolov-rats-aep-composition-05">
+          <front>
+            <title>Composing Application-Layer Action Evidence with Remote Attestation Procedures</title>
+            <author initials="A." surname="Sokolov" fullname="Anton Sokolov"/>
+            <date year="2026" month="August" day="18"/>
+          </front>
+          <seriesInfo name="Internet-Draft" value="draft-sokolov-rats-aep-composition-05"/>
+          <annotation>Work in Progress.</annotation>
+        </reference>
+      </references>
+    </references>
+    <section anchor="acknowledgements" numbered="false">
+      <name>Acknowledgements</name>
+      <t>The author welcomes review from the RATS, confidential-computing, AI-security, accelerator, and protocol-security communities, particularly on whether the proposed pre-effectuation release-control gap is already covered by existing mechanisms and where interoperable attestation semantics would be useful.</t>
+    </section>
+  </back>
+</rfc>

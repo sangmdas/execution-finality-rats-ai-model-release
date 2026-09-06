@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "execution-finality-rats-reference"
+version = "0.1.0"
+description = "Runnable reference implementation of execution-finality semantics for protected AI model-state release"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{name = "Sangam Das"}]
+dependencies = []
+
+[project.scripts]
+execution-finality-demo = "execution_finality.demo:main"
+execution-finality-benchmark = "execution_finality.benchmark:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
